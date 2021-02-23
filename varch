@@ -1,0 +1,305 @@
+#!/bin/bash
+
+if [[ ! -d /sys/firmware/efi/efivars ]] ; then
+    echo "${0##*/}: Legacy BIOS is not supported." >&2
+    exit 1
+fi
+
+NEWT_COLORS='
+    root=lightgray,magenta
+    roottext=lightgray,magenta
+    shadow=black,black
+    window=lightgray,lightgray
+    border=magenta,lightgray
+    title=magenta,lightgray
+    entry=lightgray,magenta
+    listbox=black,lightgray
+    actlistbox=magenta,lightgray
+    sellistbox=magenta,lightgray
+    actsellistbox=lightgray,magenta
+    checkbox=black,lightgray
+    actcheckbox=lightgray,magenta
+    compactbutton=black,lightgray
+    button=lightgray,magenta
+'
+
+whiptail() {
+    local z=$([[ "$1" =~ ^--(menu|checklist|radiolist)$ ]] && echo 0)
+    /bin/whiptail --backtitle "Vanilla Arch Linux Installer (2021.02.21)" "$1" "$2" 0 0 $z "${@:3}" 3>&1 1>&2 2>&3
+}
+
+invoke() {
+    eval "(set -mex ; ${@/%/ ;})"
+    status=$?
+    read -n1 -rsp '** PRESS ANY KEY TO CONTINUE **'
+    printf $'\e[2K\n'
+    return ${status}
+}
+
+unmount() {
+    command="$(swapoff -a)"
+    command+="$(umount -R /mnt)"
+    invoke "${command[@]}"
+}
+
+devices() {
+    whiptail --msgbox "$(lsblk -e 7,11 -o name,model,type,fstype,size,mountpoint)" --title "Devices"
+}
+
+storage() {
+    options=($(lsblk -e 7,11 -ldpno name,size))
+    if [[ ${#options[@]} -lt 2 ]] ; then
+        whiptail --msgbox "No available storage device."
+        return
+    fi
+    options=($(printf '%s %s OFF\n' "${options[@]}")) ; options[2]=ON
+    storage="$(whiptail --radiolist "" --title "Select Storage" "${options[@]}")" || return
+    if whiptail --yesno "Secure wipe ${storage} ?" --title "Wipe Storage" --defaultno ; then
+        invoke "dd if=/dev/zero of=${storage} bs=1M status=progress"
+    fi
+    options=("auto" "Recommended partition layout" "ON")
+    options+=("manual" "Custom partition layout" "OFF")
+    command="$(whiptail --radiolist "" --title "Partition Storage" "${options[@]}")" || return
+    summary="Device: (GPT) ${storage}\n"
+    summary+="  Boot: (FAT32) 512MB\n"
+    summary+="  Root: (EXT4) (remaining space)"
+    if [[ "${command}" =~ ^(auto)$ ]] && whiptail --yesno "${summary}" --title "Automatic Partition" --defaultno ; then
+        command=("parted -s ${storage} mktable gpt")
+        command+=("parted -s ${storage} mkpart primary fat32 1MiB 513MiB")
+        command+=("parted -s ${storage} set 1 boot on")
+        command+=("parted -s ${storage} set 1 esp on")
+        command+=("parted -s ${storage} mkpart primary ext4 513MiB 100%")
+        invoke "${command[@]}"
+    elif [[ "${command}" =~ ^(manual)$ ]] ; then
+        cfdisk ${storage}
+    fi
+}
+
+partitions() {
+    unset command
+    options=($(lsblk -e 7,11 -ipno name,size | grep -Po '^[|`]-\K.*'))
+    if [[ ${#options[@]} -lt 4 ]] ; then
+        whiptail --msgbox "Requires root and EFI partitions."
+        return
+    fi
+    options=($(printf '%s %s OFF\n' "${options[@]}")) ; options[2]=ON
+    root="$(whiptail --radiolist "" --title "Select ROOT" "${options[@]}")" || return
+    whiptail --yesno "Format ${root} as EXT4 ?" --title "Format ROOT" --defaultno && command+=("yes | mkfs.ext4 ${root}")
+    command+=("mount ${root} /mnt")
+
+    options=($(printf '%s %s OFF\n' $(lsblk -e 7,11 -ipno name,size | grep -Po '^[|`]-(?!'${root}')\K.*'))) ; options[2]=ON
+    uefi="$(whiptail --radiolist "" --title "Select UEFI" "${options[@]}")" || return
+    whiptail --yesno "Format ${uefi} as FAT32 ?" --title "Format UEFI" --defaultno && command+=("yes | mkfs.vfat -F32 ${uefi}")
+    options=("/boot/efi" "Recommended for multi-boot system" "ON")
+    options+=("/boot" "Recommended for systemd-boot" "OFF")
+    uefidir=$(whiptail --radiolist "" --title "UEFI Mountpoint" "${options[@]}") || return
+    command+=("rm -df /mnt/boot/efi &> /dev/null")
+    command+=("mkdir -p /mnt${uefidir}")
+    command+=("mount ${uefi} /mnt${uefidir}")
+
+    swapsize=$(awk '/^MemTotal/ {printf "%.0fM", $2/1024}' /proc/meminfo)
+    options=($(lsblk -e 7,11 -ipno name,size | grep -Po '^[|`]-(?!'${root}'|'${uefi}')\K.*'))
+    options=("None" "-" "ON"
+             "/swapfile" "${swapsize}" "OFF"
+             $([[ ${#options[@]} -ge 2 ]] && printf '%s %s OFF\n' "${options[@]}"))
+    swap=$(whiptail --radiolist "" --title "Select SWAP" "${options[@]}") || return
+    command+=("rm -f /mnt/swapfile &> /dev/null")
+    if [[ "${swap}" =~ ^(/swapfile)$ ]] ; then
+        while : ; do
+            swapsize=$(whiptail --inputbox "\nM = MB, G = GB" --title "SWAP Size" "${swapsize}") || return
+            [[ "${swapsize}" =~ ^([1-9][0-9]*[MG])$ ]] && break
+        done
+        [[ "${swapsize: -1}" =~ [G] ]] && swapsize=$((${swapsize/%[G]/}*1024))
+        command+=("dd if=/dev/zero of=/mnt/swapfile bs=1M count=${swapsize/%[MG]/} status=progress")
+        command+=("chmod 600 /mnt/swapfile")
+        command+=("mkswap /mnt/swapfile")
+        command+=("swapon /mnt/swapfile")
+    elif [[ "${swap}" =~ ^(/.*) ]] ; then
+        whiptail --yesno "Format ${swap} as SWAP ?" --title "Format SWAP" --defaultno && command+=("yes | mkswap ${swap}")
+        command+=("swapon ${swap}")
+    fi
+
+    invoke "${command[@]}"
+}
+
+mirrors() {
+    countries=$(reflector --list-countries)
+    readarray -t x < <(echo "${countries}" | grep -Po '(?<=\s)[A-Z]{2}(?=\s)')
+    readarray -t y < <(echo "${countries}" | grep -Po '\K.*\w(?=\s*[A-Z]{2})')
+    eval z=($(paste <(printf '"%s"\n' "${x[@]}") <(printf '"%s" "OFF"\n' "${y[@]}")))
+    mirrors=($(whiptail --checklist "" --title "Select Mirrors" "${z[@]}")) || return
+    command="reflector --sort rate -p https -l $(echo "${countries}" | wc -l)"
+    [[ ${#mirrors[@]} -gt 0 ]] && command+=" -c $(printf "%s," "${mirrors[@]}")"
+    invoke "${command/%,/} | tee /etc/pacman.d/mirrorlist"
+}
+
+install() {
+    options=("base-devel" "Required for building packages" "ON")
+    options+=("linux-firmware" "Firmware files for Linux kernel" "ON")
+    options+=("linux" "Vanilla stable Linux kernel" "ON")
+    options+=("linux-hardened" "Security-focused Linux kernel" "OFF")
+    options+=("linux-lts" "Long-term support Linux kernel" "OFF")
+    options+=("linux-zen" "Zen patched Linux kernel" "OFF")
+    packages=($(whiptail --checklist "" --title "Select Packages" "${options[@]}")) || return
+    invoke "pacstrap /mnt base ${packages[@]}" && installstatus=$?
+}
+
+chroot() {
+    invoke "arch-chroot /mnt"
+}
+
+fstab() {
+    options=("genfstab -pU" "Device UUID")
+    options+=("genfstab -pt PARTUUID" "Device PARTUUID")
+    options+=("genfstab -pL" "Device LABEL")
+    options+=("genfstab -p" "Device Name")
+    fstab=$(whiptail --menu "" --title "Generate FSTAB" --notags --default-item "${fstab}" "${options[@]}") || return
+    command=("head -4 /mnt/etc/fstab | tee /mnt/etc/fstab.new")
+    command+=("${fstab} /mnt | tee -a /mnt/etc/fstab.new")
+    command+=("mv /mnt/etc/fstab.new /mnt/etc/fstab")
+    invoke "${command[@]}"
+}
+
+timezone() {
+    options=($(printf '%s -\n' $(arch-chroot /mnt timedatectl list-timezones)))
+    timezone=$(whiptail --menu "" --title "Time Zone" --noitem --default-item "${timezone:-America/New_York}" "${options[@]}") || return
+    command=("ln -sf /mnt/usr/share/zoneinfo/${timezone} /mnt/etc/localtime")
+
+    options=("utc" "Coordinated Universal Time" "ON")
+    options+=("localtime" "Current Time Zone" "OFF")
+    clock=$(whiptail --radiolist "" --title "System Clock" "${options[@]}") || return
+    command+=("arch-chroot /mnt hwclock --systohc --${clock}")
+    invoke "${command[@]}"
+}
+
+keyboard() {
+    options=($(printf '%s -\n' $(arch-chroot /mnt bash -c "localectl list-keymaps")))
+    keymap=$(whiptail --menu "" --title "Keyboard Layout" --noitem --default-item "${keymap:-us}" "${options[@]}") || return
+    command=("sed -i -E '/^KEYMAP=/!{q1}; {s/^(KEYMAP=).*/\1${keymap}/}' /mnt/etc/vconsole.conf 2> /dev/null || tee -a /mnt/etc/vconsole.conf <<< 'KEYMAP=${keymap}'")
+
+    options=($(arch-chroot /mnt bash -c "cd /usr/share/kbd/consolefonts/; ls *.{psf,psfu}.gz")) ; options=(${options[@]/%.psf*/ -})
+    font=$(whiptail --menu "" --title "Console Font" --noitem --default-item "${font:-default8x16}" "${options[@]}") || return
+    command+=("sed -i -E '/^FONT=/!{q1}; {s/^(FONT=).*/\1${font}/}' /mnt/etc/vconsole.conf 2> /dev/null || tee -a /mnt/etc/vconsole.conf <<< 'FONT=${font}'")
+    invoke "${command[@]}"
+}
+
+locale() {
+    options=($(printf '%s -\n' $(arch-chroot /mnt grep -Po '^#?\K\w*(?=.UTF-8)' /etc/locale.gen)))
+    locale=$(whiptail --menu "" --title "System Locale" --noitem --default-item "${locale:-en_US}" "${options[@]}") || return
+    command=("sed -i '/^[^#]/s/^/#/' /mnt/etc/locale.gen")
+    command+=("sed -i '/^#${locale}.UTF-8/s/^#//' /mnt/etc/locale.gen")
+    command+=("sed -i -E '/^LANG=/!{q1}; {s/^(LANG=).*/\1${locale}.UTF-8/}' /mnt/etc/locale.conf 2> /dev/null || tee -a /mnt/etc/locale.conf <<< 'LANG=${locale}.UTF-8'")
+    command+=("arch-chroot /mnt locale-gen")
+    invoke "${command[@]}"
+}
+
+hostname() {
+    while : ; do
+        hostname=$(whiptail --inputbox "" --title "Network Hostname" "${hostname:-archlinux}") || return
+        [[ "${hostname}" =~ ^([a-z0-9][a-z0-9-]{0,62}[^-])$ ]] && break
+    done
+    command=("tee /mnt/etc/hostname <<< '${hostname}'")
+    summary="# IPv4\n"
+    summary+="127.0.0.1 localhost\n"
+    summary+="127.0.1.1 ${hostname}.localdomain ${hostname}\n\n"
+    summary+="# IPv6\n"
+    summary+="::1 ip6-localhost ip6-loopback\n"
+    summary+="ff02::1 ip6-allnodes\n"
+    summary+="ff02::2 ip6-allrouters\n"
+    summary+="ff02::3 ip6-allhosts"
+    command+=("head -2 /mnt/etc/hosts | tee /mnt/etc/hosts.new")
+    command+=("tee -a /mnt/etc/hosts.new <<< $'${summary}'")
+    command+=("mv /mnt/etc/hosts.new /mnt/etc/hosts")
+    invoke "${command[@]}"
+}
+
+account() {
+    unset command password
+    while : ; do
+        account="$(whiptail --inputbox "" --title "Account Username" "${account:-root}")" || return
+        [[ "${account}" =~ ^([a-z_][a-z0-9_]{0,31})$ ]] && break
+    done
+    if [[ ! "${account}" =~ ^(root)$ ]] ; then
+        arch-chroot /mnt bash -c "getent passwd ${account}" ; userexist=$?
+        if [[ ${userexist} -eq 0 ]] && whiptail --yesno "Remove user '${account}' ?" --title "Remove Account" --defaultno ; then
+            invoke "arch-chroot /mnt userdel -rf ${account}"
+            unset account
+            return
+        fi
+        command=("arch-chroot /mnt bash -c '[[ ! \$(pacman -Q sudo) ]] && pacman -Sy --noconfirm sudo'")
+        command+=("sed -i '/^# %wheel ALL=(ALL) ALL$/s/^# //' /mnt/etc/sudoers")
+        command+=("arch-chroot /mnt useradd -m -G wheel,sys,lp,audio,input,storage,video,network,power,users -s /bin/bash ${account}")
+    fi
+    while : ; do
+        password="$(whiptail --inputbox "" --title "Account Password")" || { unset account ; return ; }
+        [[ -n "${password}" ]] && break
+    done
+    command+=("arch-chroot /mnt chpasswd <<< '${account}:${password}'")
+    invoke "${command[@]}" || unset account
+}
+
+bootloader() {
+    options=("GRUB" "Multi-boot loader" "ON")
+    options+=("systemd-boot" "UEFI boot manager" "OFF")
+    bootloader="$(whiptail --radiolist "" --title "Select Bootloader" "${options[@]}")" || return
+    if [[ "${bootloader}" =~ ^(GRUB)$ ]]; then
+        command=("arch-chroot /mnt pacman -Sy --noconfirm grub efibootmgr")
+        command+=("arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=${uefidir} --boot-directory=/boot --bootloader-id='Arch Linux'")
+        command+=("arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg")
+    elif [[ "${bootloader}" =~ ^(systemd-boot)$ ]]; then
+        command=("arch-chroot /mnt bootctl install")
+        command+=("sed -i '/^#timeout.*/s/^#//' /mnt${uefidir}/loader/loader.conf")
+        kernel=$(cd /mnt/boot ; ls vmlinuz-linux* 2> /dev/null | head -1)
+        summary=("title Arch Linux")
+        summary+=("linux /vmlinuz-linux")
+        summary+=("initrd /initramfs-linux.img")
+        summary+=("options root='UUID=$(lsblk -no uuid ${root})' rw")
+        if [[ "${kernel##*-}" =~ ^(hardened|lts|zen)$ ]]; then
+            summary[1]="${summary[1]/%/-${kernel##*-}}"
+            summary[2]="${summary[2]/%.img/-${kernel##*-}.img}"
+        fi
+        printf -v summary "%s\n" "${summary[@]}"
+        command+=("tee /mnt${uefidir}/loader/entries/default.conf <<< $'${summary}'")
+    fi
+    invoke "${command[@]}"
+}
+
+export NEWT_COLORS
+trap : INT
+
+summary="   Author: Yuriusu (yuriusu@tuta.io)\n"
+summary+="  License: MIT (https://opensource.org/licenses/MIT)\n"
+summary+=" Homepage: GitHub (https://github.com/yuriusu/varch#readme)\n"
+summary+="Reference: ArchWiki (https://wiki.archlinux.org/index.php/Installation_guide)"
+whiptail --msgbox "${summary}" --ok-button "Continue"
+
+while [[ -z "${root}" || -z "${uefi}" || -z "${uefidir}" ]] \
+    || ! mountpoint -q "$(lsblk -no mountpoint ${root})" \
+    || ! mountpoint -q "$(lsblk -no mountpoint ${uefi})"
+do
+    options=("devices" "List Block Devices")
+    options+=("storage" "Partition Storage")
+    options+=("partitions" "Mount Partitions")
+    prepare=$(whiptail --menu "" --title "Preparation" --notags --default-item "${prepare}" --cancel-button "Quit" "${options[@]}")
+    [[ $? -ne 0 ]] && { yes | unmount &> /dev/null ; exit ; } || ${prepare}
+done
+
+while [[ -z "${installstatus}" || ${installstatus} -ne 0 ]] ; do
+    options=("mirrors" "Update Mirrorlist")
+    options+=("install" "Install Packages")
+    install=$(whiptail --menu "" --title "Installation" --notags --default-item "${install}" --cancel-button "Quit" "${options[@]}")
+    [[ $? -ne 0 ]] && { yes | unmount &> /dev/null ; exit ; } || ${install}
+done
+
+while : ; do
+    options=("chroot" "Chroot Environment")
+    options+=("fstab" "File Systems Table")
+    options+=("timezone" "Timezone and Clock")
+    options+=("keyboard" "Keyboard and Console")
+    options+=("locale" "System Locale")
+    options+=("hostname" "Network Hostname")
+    options+=("account" "User Accounts")
+    options+=("bootloader" "System Bootloader")
+    configure=$(whiptail --menu "" --title "Configuration" --notags --cancel-button "Done" --default-item "${configure}" "${options[@]}")
+    [[ $? -ne 0 ]] && { yes | unmount &> /dev/null ; whiptail --yesno "Reboot the systen now ?" && reboot || exit ; } || ${configure}
+done
